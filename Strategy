@@ -1,0 +1,167 @@
+from ib_insync import *
+import numpy as np
+import pandas as pd
+import nest_asyncio
+import ta
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+import datetime
+import asyncio
+
+#Process data and get the technical indicator information that we will need in trading
+#we will use VWAP and ATR to create upper and lower bands of stock price movement
+def data_processing(data):
+    data['VWAP'] = ta.volume.volume_weighted_average_price(high=data['high'],low=data['low'],close=data['close'],volume=data['volume'],window=30)
+    data['ATR']=ta.volatility.average_true_range(data['high'],data['low'],data['close'])
+    data['VWAP_up'] = data['VWAP'] + 4*data['ATR']
+    data['VWAP_down'] = data['VWAP'] - 4*data['ATR']
+    rsi7 = ta.momentum.RSIIndicator(data['close'],7)
+    rsi14 = ta.momentum.RSIIndicator(data['close'],14)
+    data['RSI7'] = rsi7.rsi()
+    data['RSI14'] = rsi14.rsi()
+    data.dropna(inplace=True)
+    data['date_ordinal'] = np.zeros(len(data))
+    
+    for i in range(1,len(data)):
+        data['date_ordinal'].iloc[i] = data['date_ordinal'].iloc[i-1]+1
+    
+    return data
+
+#Main buy strategy: we will buy if the VWAP is upward sloping, current price is away from the upper band and RSI of the stock is greater than 50
+def buy_strategy(data,reason,atr=0.3):
+    global buy
+    reg = LinearRegression().fit(np.array(data[-3:]['date_ordinal']).reshape(len(data[-3:]),1),data[-3:]['VWAP'])
+    trend1 = reg.coef_[0]
+     
+    if trend1>0 and 1<data['close'].iloc[-1]/data['VWAP'].iloc[-1]<1.002 and data['VWAP_up'].iloc[-1]/data['close'].iloc[-1]>1.005 and data['RSI7'].iloc[-1]>50:
+        reason = 0
+        buy = True
+        stoploss = data['VWAP'].iloc[-1]-atr
+        
+    elif 1<data['close'].iloc[-1]/data['VWAP_down'].iloc[-1]<1.002 and data['RSI7'].iloc[-1]<30:
+        reason = 1
+        buy = True
+        stoploss = data['VWAP_down'].iloc[-1]-atr
+        
+    return buy,reason,stoploss
+
+#We use trailing stop for our position in order to get higher profit when we are winning
+def trailing(close,buy_price,atr=0.3):
+    global stoploss
+    global trailing_stop
+    if close>buy_price+atr:
+        target = int((close-buy_price)/atr)
+        trailing_stop2 = max(trailing_stop,buy_price+target/2*atr)
+    else:
+        trailing_stop2 = stoploss
+    
+    return trailing_stop2
+
+
+#Using Interavtive Broker TWS to execute the strategy
+ib = IB()
+util.startLoop()
+buy = False
+sell = False
+stoploss= 0 
+trailing_stop = 0
+idd = 1
+
+#we define a time range that the program will run within and the interval of running
+for t in IB.timeRange(datetime.time(8, 30), datetime.time(14, 55), 60):
+ 
+    try:
+        #7497 for paper trading and 7496 for real trading
+        ib.connect('127.0.0.1', 7497,idd)
+        
+        #Define which stock we want to trade
+        stock = Stock('Stock Ticker', 'SMART', 'USD')
+        ib.qualifyContracts(stock)
+        shares_holding = 0
+        
+        #Get the current position of the account
+        position = ib.positions()
+        if position != []:
+            a = [i.position for i in position]
+            b = [k.avgCost for k in position]
+            for g in a:
+                shares_holding = g
+            for j in b:
+                avgcost = j
+                
+        #Get the current cash value of the account
+        for v in ib.accountValues():
+            if v.tag == 'CashBalance' and v.currency == 'USD':
+                cashbalance = float(v.value)
+                print('Cash Balance: ', cashbalance)
+
+        pnl = ibReqPnL("Your Account Number in Interactive Broker")
+        c = [i.dailyPnL for i in pnl]
+        for o in c:
+            daily_pnl = o
+        print("Daily P/L: " + str(daily_pnl))
+        
+        #Get the stock's 1 minute bar data
+        bars = ib.reqHistoricalData(stock, endDateTime='', durationStr='2 D',barSizeSetting='1 min', whatToShow='TRADES', useRTH=True)
+      
+
+        # convert the data to pandas dataframe
+        data = util.df(bars)
+       
+        data = data_processing(data)
+
+        buy_share = int(cashbalance/data['close'].iloc[-1])-1
+        buy = False
+
+        if position == []:
+            reason = -1
+            buy,reason,stoploss = buy_strategy(data,reason,atr=data['ATR'].iloc[-1])
+            if buy:
+                order = MarketOrder('BUY', buy_share)
+                trade = ib.placeOrder(stock, order)
+                trailing_stop = stoploss
+                reason_list.append(reason)
+                while not trade.isDone():
+                    ib.waitOnUpdate()
+                print(ib.positions())
+                print("Stoploss: " + str(stoploss))
+         
+        if shares_holding>0:
+            temp = trailing(data['close'].iloc[-1],avgcost,atr=data['ATR'].iloc[-1])
+            trailing_stop = temp
+            print("Trailing Stop: " + str(trailing_stop))
+            print("Close Price: " + str(data['close'].iloc[-1]))
+        
+            if data['close'].iloc[-1]<trailing_stop:
+                buy = False
+                order = MarketOrder('SELL', shares_holding)
+                trade = ib.placeOrder(stock, order)
+                while not trade.isDone():
+                    ib.waitOnUpdate()
+                print(ib.positions())
+                continue
+                
+            #we will close all the position at 14:30 CPT and stop the program
+            elif str(data['date'].iloc[-1])[11:16]=="14:30":
+                buy = False
+                order = MarketOrder('SELL', shares_holding)
+                trade = ib.placeOrder(stock, order)
+                while not trade.isDone():
+                    ib.waitOnUpdate()
+                print(ib.positions())
+                break
+      
+
+        ib.run()
+
+
+        ib.disconnect()
+
+        if str(data['date'].iloc[-1])[11:16]=="14:30":
+            break
+            
+    except TypeError:
+        continue
+    except TimeoutError:
+        idd += 1
+        continue
